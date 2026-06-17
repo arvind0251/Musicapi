@@ -1,5 +1,7 @@
 fastapi
 uvicorn
-telethon
+pyrogram
+tgcrypto
+yt-dlp
+aiohttp
 python-dotenv
-aiofiles
