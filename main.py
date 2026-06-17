@@ -1,98 +1,130 @@
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+import os
+import re
 from pathlib import Path
-from config import DOMAIN, PORT, INDEX_CHANNEL, STORAGE_CHANNEL
-from telegram_client import fetch_index, get_metadata, download_media
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi.responses import FileResponse
+from pyrogram.errors import RPCError
 
-app = FastAPI(title="Telegram Media API", version="1.0.0")
+from config import DOMAIN, PORT
+from telegram_client import (
+    app as tg,
+    fetch_index,
+    upload_to_storage,
+    add_to_index,
+    download_from_storage
+)
+from youtube import youtube_downloader
+
+app = FastAPI(title="Telegram Music API", version="1.0.0")
 
 songs_db = []
-DOWNLOAD_DIR = Path("downloads")
-DOWNLOAD_DIR.mkdir(exist_ok=True)
+Path("downloads").mkdir(exist_ok=True)
 
 @app.on_event("startup")
 async def startup():
+    await tg.start()
     global songs_db
     songs_db = await fetch_index()
+
+@app.on_event("shutdown")
+async def shutdown():
+    await tg.stop()
 
 @app.get("/")
 async def root():
     return {
-        "message": "Telegram Media API",
-        "index_channel": INDEX_CHANNEL,
-        "storage_channel": STORAGE_CHANNEL
+        "message": "Telegram Music API",
+        "domain": DOMAIN,
+        "port": PORT
     }
 
-@app.post("/api/refresh")
+@app.post("/refresh")
 async def refresh():
     global songs_db
     songs_db = await fetch_index()
     return {"ok": True, "total": len(songs_db)}
 
-@app.get("/api/media")
-async def get_all_media():
-    items = []
-    for song in songs_db:
-        meta = await get_metadata(song)
-        if meta:
-            items.append(meta)
-    return {"total": len(items), "media": items}
+@app.get("/songs")
+async def all_songs():
+    return {"total": len(songs_db), "songs": songs_db}
 
-@app.get("/api/media/search")
-async def search(q: str, type: str = None):
-    results = []
-    for song in songs_db:
-        if q.lower() in song["title"].lower() or q.lower() in song["artist"].lower():
-            if type and song["type"] != type:
-                continue
-            meta = await get_metadata(song)
-            if meta:
-                results.append(meta)
-    return {"query": q, "total": len(results), "results": results}
+@app.get("/search")
+async def search(q: str):
+    result = [
+        s for s in songs_db
+        if q.lower() in s["title"].lower() or q.lower() in s["artist"].lower()
+    ]
+    return {"query": q, "total": len(result), "results": result}
 
-@app.get("/api/media/{media_id}")
-async def media_detail(media_id: int):
-    song = next((s for s in songs_db if s["storage_id"] == media_id), None)
+@app.get("/play/{storage_id}")
+async def play(storage_id: int):
+    song = next((s for s in songs_db if s["storage_id"] == storage_id), None)
+    if song:
+        file_path = await download_from_storage(storage_id)
+        if not file_path:
+            raise HTTPException(404, "Telegram file not found")
+        return {
+            "source": "telegram",
+            "title": song["title"],
+            "artist": song["artist"],
+            "type": song["type"],
+            "url": f"/download/{storage_id}"
+        }
+
+    raise HTTPException(404, "Not found in index")
+
+@app.get("/download/{storage_id}")
+async def download(storage_id: int):
+    song = next((s for s in songs_db if s["storage_id"] == storage_id), None)
     if not song:
-        raise HTTPException(status_code=404, detail="Not found")
-    meta = await get_metadata(song)
-    if not meta:
-        raise HTTPException(status_code=404, detail="Storage file missing")
-    return meta
+        raise HTTPException(404, "Song not found")
 
-@app.get("/api/media/{media_id}/download")
-async def download(media_id: int):
-    song = next((s for s in songs_db if s["storage_id"] == media_id), None)
-    if not song:
-        raise HTTPException(status_code=404, detail="Not found")
-
-    file_path = await download_media(song)
+    file_path = await download_from_storage(storage_id)
     if not file_path:
-        raise HTTPException(status_code=500, detail="Download failed")
+        raise HTTPException(404, "File not available in storage")
 
-    meta = await get_metadata(song)
     ext = "mp4" if song["type"] == "video" else "mp3"
     return FileResponse(
-        path=file_path,
-        filename=f"{meta['title']}-{meta['artist']}.{ext}",
-        media_type=meta.get("mime_type", "application/octet-stream")
+        file_path,
+        filename=f"{song['title']}-{song['artist']}.{ext}"
     )
 
-@app.get("/api/media/{media_id}/play")
-async def play(media_id: int):
-    song = next((s for s in songs_db if s["storage_id"] == media_id), None)
-    if not song:
-        raise HTTPException(status_code=404, detail="Not found")
+@app.post("/fallback/youtube")
+async def fallback_youtube(q: str, song_type: str = "audio", background_tasks: BackgroundTasks = None):
+    query = q.strip()
+    if not query:
+        raise HTTPException(400, "query required")
 
-    meta = await get_metadata(song)
-    if not meta:
-        raise HTTPException(status_code=404, detail="Storage file missing")
+    search_url = f"https://www.youtube.com/results?search_query={query.replace(' ', '+')}"
+    downloaded = await youtube_downloader.download(search_url, video=(song_type == "video"))
+    if not downloaded:
+        raise HTTPException(500, "YouTube download failed")
 
-    return {
-        "media_id": media_id,
-        "title": meta["title"],
-        "artist": meta["artist"],
-        "type": meta["type"],
-        "play_url": f"http://{DOMAIN}:{PORT}/api/media/{media_id}/download",
-        "mime_type": meta["mime_type"]
-    }
+    title = query
+    artist = "Unknown"
+    song_type = "video" if song_type == "video" else "audio"
+
+    try:
+        storage_id = await upload_to_storage(downloaded, song_type, title, artist)
+        if not storage_id:
+            raise HTTPException(500, "Upload to storage failed")
+
+        index_id = await add_to_index(storage_id, title, artist, song_type)
+        songs_db.append({
+            "index_id": index_id,
+            "storage_id": storage_id,
+            "title": title,
+            "artist": artist,
+            "type": song_type,
+            "caption": f"Song: {title} - {artist} | ID: {storage_id} | {song_type}"
+        })
+
+        return {
+            "ok": True,
+            "source": "youtube",
+            "storage_id": storage_id,
+            "index_id": index_id,
+            "download_url": f"http://{DOMAIN}:{PORT}/download/{storage_id}"
+        }
+    except RPCError as e:
+        raise HTTPException(500, f"Telegram upload failed: {e}")
